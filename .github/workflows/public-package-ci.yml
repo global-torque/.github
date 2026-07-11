@@ -68,6 +68,19 @@ jobs:
       - name: Review dependency changes
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
+  reuse:
+    name: REUSE 3.3 compliance
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned REUSE tool
+        run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
+      - name: Validate licensing metadata
+        run: reuse lint
+
   dco:
     name: DCO sign-off
     if: github.event_name == 'pull_request'
