@@ -2,6 +2,12 @@ name: Reusable public package CI
 
 on:
   workflow_call:
+    inputs:
+      install-browser:
+        description: Install the package's pinned browser before running CI.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +38,9 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Install browser test runtime
+        if: inputs.install-browser
+        run: pnpm run browser:install
       - name: Run release-grade package checks
         run: pnpm run ci
 
@@ -55,6 +64,9 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Install browser test runtime
+        if: inputs.install-browser
+        run: pnpm run browser:install
       - name: Run package checks
         run: pnpm run ci
 
