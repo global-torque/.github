@@ -80,6 +80,77 @@ jobs:
       - name: Review dependency changes
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
 
+  workflow-policy:
+    name: Workflow policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install verified actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "${archive}" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${archive}" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" actionlint
+      - name: Validate workflow syntax and pinned actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${RUNNER_TEMP}/actionlint" .github/workflows/*.yml
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+
+          const workflowDirectory = path.join('.github', 'workflows');
+          for (const name of fs.readdirSync(workflowDirectory)) {
+            if (!name.endsWith('.yml') && !name.endsWith('.yaml')) continue;
+            const source = fs.readFileSync(path.join(workflowDirectory, name), 'utf8');
+            for (const match of source.matchAll(/^\s*uses:\s*[^\s@]+@([^\s#]+)/gm)) {
+              if (!/^[0-9a-f]{40}$/.test(match[1])) {
+                throw new Error(`${name} contains an action that is not pinned by SHA.`);
+              }
+            }
+          }
+
+          const candidate = fs.readFileSync(
+            path.join(workflowDirectory, 'candidate.yml'),
+            'utf8',
+          );
+          const required = [
+            'tags:',
+            'v*',
+            'artifact-metadata: write',
+            'fetch-depth: 0',
+            'git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main',
+            'test "$(git rev-parse origin/main)" = "${GITHUB_SHA}"',
+            "          printf 'checksums=%s\\n' \"${checksums[0]}\" >> \"${GITHUB_OUTPUT}\"",
+            'subject-checksums: ${ { steps.subject.outputs.checksums } }'.replaceAll(' ', ''),
+            'gh attestation verify',
+            '--digest-alg sha512',
+            '--signer-workflow',
+            '--signer-digest "${GITHUB_SHA}"',
+            '--source-digest "${GITHUB_SHA}"',
+            '--source-ref "${GITHUB_REF}"',
+            '--deny-self-hosted-runners',
+          ];
+          const compactCandidate = candidate.replaceAll(' ', '');
+          for (const marker of required) {
+            const haystack = marker.includes('subject-checksums:')
+              ? compactCandidate
+              : candidate;
+            if (!haystack.includes(marker)) {
+              throw new Error(`candidate.yml is missing release policy marker: ${marker}`);
+            }
+          }
+          NODE
+
   reuse:
     name: REUSE 3.3 compliance
     runs-on: ubuntu-24.04
@@ -111,8 +182,37 @@ jobs:
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/commits" \
             > "${RUNNER_TEMP}/commits.json"
-          jq -e '
-            add
-            | length > 0 and all(.[].commit.message;
-                test("(?im)^Signed-off-by: [^<\\n]+ <[^>\\n]+>$"))
-          ' "${RUNNER_TEMP}/commits.json" > /dev/null
+          node - "${RUNNER_TEMP}/commits.json" <<'NODE'
+          const fs = require('node:fs');
+
+          const pages = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          const commits = pages.flat();
+          if (commits.length === 0) throw new Error('Pull request has no commits.');
+          const normalizeName = (value) => value.trim().replace(/\s+/g, ' ');
+          for (const entry of commits) {
+            const identities = [entry.commit.author, entry.commit.committer]
+              .filter(Boolean)
+              .map(({ name, email }) => ({
+                name: normalizeName(name),
+                email: email.trim().toLowerCase(),
+              }));
+            const trailers = [...entry.commit.message.matchAll(
+              /^Signed-off-by:\s*([^<\n]+?)\s*<([^>\n]+)>\s*$/gim,
+            )].map((match) => ({
+              name: normalizeName(match[1]),
+              email: match[2].trim().toLowerCase(),
+            }));
+            const valid = trailers.some((trailer) =>
+              identities.some(
+                (identity) =>
+                  identity.name === trailer.name &&
+                  identity.email === trailer.email,
+              ),
+            );
+            if (!valid) {
+              throw new Error(
+                `Commit ${entry.sha.slice(0, 12)} lacks an author- or committer-matching Signed-off-by trailer.`,
+              );
+            }
+          }
+          NODE
