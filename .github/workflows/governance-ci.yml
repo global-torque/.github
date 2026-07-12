@@ -33,8 +33,15 @@ jobs:
             | sha256sum --check --strict
           tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" actionlint
       - name: Validate workflows
+        shell: bash
         run: |
-          "${RUNNER_TEMP}/actionlint" .github/workflows/*.yml
+          set -euo pipefail
+          mapfile -d '' workflows < <(
+            find .github/workflows -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) -print0 | sort -z
+          )
+          test "${#workflows[@]}" -gt 0
+          "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
       - name: Install pinned REUSE tool
         run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
       - name: Validate licensing metadata

@@ -103,7 +103,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "${RUNNER_TEMP}/actionlint" .github/workflows/*.yml
+          mapfile -d '' workflows < <(
+            find .github/workflows -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) -print0 | sort -z
+          )
+          test "${#workflows[@]}" -gt 0
+          "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
@@ -112,9 +117,33 @@ jobs:
           for (const name of fs.readdirSync(workflowDirectory)) {
             if (!name.endsWith('.yml') && !name.endsWith('.yaml')) continue;
             const source = fs.readFileSync(path.join(workflowDirectory, name), 'utf8');
-            for (const match of source.matchAll(/^\s*uses:\s*[^\s@]+@([^\s#]+)/gm)) {
-              if (!/^[0-9a-f]{40}$/.test(match[1])) {
-                throw new Error(`${name} contains an action that is not pinned by SHA.`);
+            for (const match of source.matchAll(
+              /^\s*(?:-\s*)?uses:\s*(\S+?)(?:\s+#.*)?$/gm,
+            )) {
+              let reference = match[1];
+              if (
+                (reference.startsWith('"') && reference.endsWith('"')) ||
+                (reference.startsWith("'") && reference.endsWith("'"))
+              ) {
+                reference = reference.slice(1, -1);
+              }
+              if (reference.startsWith('./')) continue;
+              if (reference.startsWith('docker://')) {
+                if (!/^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/.test(reference)) {
+                  throw new Error(
+                    `${name} contains a Docker action that is not pinned by SHA-256 digest: ${reference}`,
+                  );
+                }
+                continue;
+              }
+              if (
+                !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/.test(
+                  reference,
+                )
+              ) {
+                throw new Error(
+                  `${name} contains an invalid or non-SHA-pinned action reference: ${reference}`,
+                );
               }
             }
           }
