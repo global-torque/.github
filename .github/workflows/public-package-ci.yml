@@ -37,12 +37,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm --config.ignore-pnpmfile=true install --frozen-lockfile --ignore-scripts
       - name: Install browser test runtime
         if: inputs.install-browser
         run: pnpm run browser:install
       - name: Run release-grade package checks
-        run: pnpm run ci
+        run: pnpm --config.enable-pre-post-scripts=false run ci
 
   informational-node-26:
     name: Node 26 informational
@@ -63,12 +63,12 @@ jobs:
           node-version: 26.5.0
           cache: pnpm
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm --config.ignore-pnpmfile=true install --frozen-lockfile --ignore-scripts
       - name: Install browser test runtime
         if: inputs.install-browser
         run: pnpm run browser:install
       - name: Run package checks
-        run: pnpm run ci
+        run: pnpm --config.enable-pre-post-scripts=false run ci
 
   dependency-review:
     name: Dependency review
@@ -421,14 +421,13 @@ jobs:
               'test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"',
               'test "$(git rev-parse origin/main)" = "${GITHUB_SHA}"',
               'test "v$(node -p "require(\'./package.json\').version")" = "${GITHUB_REF_NAME}"',
-              "pnpm install --frozen-lockfile",
+              "pnpm --config.ignore-pnpmfile=true install --frozen-lockfile --ignore-scripts",
           )
-          BUILD_COMMANDS = (
+          PACK_COMMANDS = (
               "set -euo pipefail",
-              "rm -rf dist release",
-              "pnpm run build",
+              "rm -rf release",
               "mkdir release",
-              "pnpm pack --pack-destination release",
+              "pnpm --config.ignore-scripts=true --config.ignore-pnpmfile=true pack --pack-destination release",
               "node scripts/create-release-manifest.mjs release",
           )
           CHECKSUM_COMMANDS = (
@@ -556,9 +555,13 @@ jobs:
                       f"{source} browser setup",
                   )
                   cursor += 1
-              require_run_step(steps[cursor], ("pnpm run ci",), f"{source} package gates")
+              require_run_step(
+                  steps[cursor],
+                  ("pnpm --config.enable-pre-post-scripts=false run ci",),
+                  f"{source} package gates",
+              )
               cursor += 1
-              require_run_step(steps[cursor], BUILD_COMMANDS, f"{source} package build", shell=True)
+              require_run_step(steps[cursor], PACK_COMMANDS, f"{source} package pack", shell=True)
               cursor += 1
               require_run_step(
                   steps[cursor],
@@ -841,6 +844,23 @@ jobs:
           expect_candidate_rejected(
               continuation_comment_decoy,
               "a continuation-breaking comment",
+          )
+
+          rebuild_decoy = copy.deepcopy(candidate_document)
+          for step in rebuild_decoy["jobs"]["build"]["steps"]:
+              run = step.get("run") if isinstance(step, dict) else None
+              if isinstance(run, str) and "pack --pack-destination release" in run:
+                  step["run"] = run.replace(
+                      "rm -rf release\n",
+                      "rm -rf dist release\npnpm run build\n",
+                      1,
+                  )
+                  break
+          else:
+              raise ValueError("Candidate self-test could not locate pack step")
+          expect_candidate_rejected(
+              rebuild_decoy,
+              "a rebuild after the package gates",
           )
           PYTHON
 
