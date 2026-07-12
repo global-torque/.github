@@ -303,14 +303,21 @@ jobs:
                   runs = document.get("runs", {})
                   if not isinstance(runs, dict):
                       return
-                  if runs.get("using") == "docker":
+                  raw_using = runs.get("using")
+                  if not isinstance(raw_using, str):
+                      raise ValueError(
+                          f"{self.display_name(resolved)} contains a non-string runs.using value"
+                      )
+                  using = raw_using.casefold()
+                  if using == "docker":
                       image = runs.get("image")
                       if not isinstance(image, str):
                           raise ValueError(
                               f"{self.display_name(resolved)} contains a non-string Docker image"
                           )
-                      if image.startswith("docker://"):
-                          self.validate_external(image, resolved)
+                      if image.casefold().startswith("docker://"):
+                          normalized_image = f"docker://{image[len('docker://'):]}"
+                          self.validate_external(normalized_image, resolved)
                           return
                       dockerfile = (resolved.parent / image).resolve()
                       try:
@@ -324,7 +331,7 @@ jobs:
                               f"{self.display_name(resolved)} contains a missing Dockerfile path: {image}"
                           )
                       return
-                  if runs.get("using") != "composite":
+                  if using != "composite":
                       return
                   steps = runs.get("steps", [])
                   if not isinstance(steps, list):
@@ -386,7 +393,7 @@ jobs:
               encoding="utf-8",
           )
           (fixture_action / "action.yml").write_text(
-              """name: hostile-local-action\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n""",
+              """name: hostile-local-action\nruns:\n  using: Composite\n  steps:\n    - uses: actions/checkout@v4\n""",
               encoding="utf-8",
           )
           try:
@@ -402,7 +409,13 @@ jobs:
           )
           PolicyScanner(fixture_root).scan_all_workflows()
           (fixture_action / "action.yml").write_text(
-              """name: hostile-docker-action\nruns:\n  using: docker\n  image: docker://alpine:latest\n""",
+              """name: hostile-docker-action\nruns:\n  using: Docker\n  image: DOCKER://alpine:latest\n""",
+              encoding="utf-8",
+          )
+          decoy_directory = fixture_action / "DOCKER:"
+          decoy_directory.mkdir()
+          (decoy_directory / "alpine:latest").write_text(
+              "not a Dockerfile\n",
               encoding="utf-8",
           )
           try:
