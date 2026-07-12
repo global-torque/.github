@@ -113,13 +113,30 @@ jobs:
           const fs = require('node:fs');
           const path = require('node:path');
 
-          const workflowDirectory = path.join('.github', 'workflows');
-          for (const name of fs.readdirSync(workflowDirectory)) {
-            if (!name.endsWith('.yml') && !name.endsWith('.yaml')) continue;
-            const source = fs.readFileSync(path.join(workflowDirectory, name), 'utf8');
-            for (const match of source.matchAll(
-              /^\s*(?:-\s*)?uses:\s*(\S+?)(?:\s+#.*)?$/gm,
-            )) {
+          const canonicalUses = /^\s*(?:-\s*)?uses:\s*(\S+?)(?:\s+#.*)?$/;
+          const anyUsesKey = /(?:^\s*|[-{,]\s*)(?:"uses"|'uses'|uses)\s*:/;
+          const blockScalar = /:\s*[|>][+-]?\d?\s*(?:#.*)?$/;
+          const actionReferences = (source, name) => {
+            const references = [];
+            let blockIndent = null;
+            for (const [index, line] of source.split(/\r?\n/u).entries()) {
+              const trimmed = line.trim();
+              const indentation = line.length - line.trimStart().length;
+              if (blockIndent !== null) {
+                if (trimmed === '' || indentation > blockIndent) continue;
+                blockIndent = null;
+              }
+              if (blockScalar.test(line)) {
+                blockIndent = indentation;
+                continue;
+              }
+              if (!anyUsesKey.test(line)) continue;
+              const match = canonicalUses.exec(line);
+              if (!match) {
+                throw new Error(
+                  `${name}:${index + 1} uses a non-canonical action key; use an unquoted "uses:" key on its own line.`,
+                );
+              }
               let reference = match[1];
               if (
                 (reference.startsWith('"') && reference.endsWith('"')) ||
@@ -127,24 +144,59 @@ jobs:
               ) {
                 reference = reference.slice(1, -1);
               }
-              if (reference.startsWith('./')) continue;
-              if (reference.startsWith('docker://')) {
-                if (!/^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/.test(reference)) {
-                  throw new Error(
-                    `${name} contains a Docker action that is not pinned by SHA-256 digest: ${reference}`,
-                  );
-                }
-                continue;
+              references.push(reference);
+            }
+            return references;
+          };
+          const validateActionReference = (reference, name) => {
+            if (reference.startsWith('./')) return;
+            if (reference.startsWith('docker://')) {
+              if (/^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/.test(reference)) {
+                return;
               }
-              if (
-                !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/.test(
-                  reference,
-                )
-              ) {
-                throw new Error(
-                  `${name} contains an invalid or non-SHA-pinned action reference: ${reference}`,
-                );
-              }
+              throw new Error(
+                `${name} contains a Docker action that is not pinned by SHA-256 digest: ${reference}`,
+              );
+            }
+            if (
+              /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/.test(
+                reference,
+              )
+            ) {
+              return;
+            }
+            throw new Error(
+              `${name} contains an invalid or non-SHA-pinned action reference: ${reference}`,
+            );
+          };
+
+          for (const bypass of [
+            '- uses : actions/checkout@v4',
+            '- "uses": actions/checkout@v4',
+            '- { uses: actions/checkout@v4 }',
+          ]) {
+            let rejected = false;
+            try {
+              actionReferences(`steps:\n  ${bypass}\n`, 'policy-self-test.yml');
+            } catch {
+              rejected = true;
+            }
+            if (!rejected) throw new Error(`Workflow policy accepted bypass: ${bypass}`);
+          }
+          for (const reference of [
+            './.github/actions/local',
+            `actions/checkout@${'a'.repeat(40)}`,
+            `docker://alpine@sha256:${'b'.repeat(64)}`,
+          ]) {
+            validateActionReference(reference, 'policy-self-test.yml');
+          }
+
+          const workflowDirectory = path.join('.github', 'workflows');
+          for (const name of fs.readdirSync(workflowDirectory)) {
+            if (!name.endsWith('.yml') && !name.endsWith('.yaml')) continue;
+            const source = fs.readFileSync(path.join(workflowDirectory, name), 'utf8');
+            for (const reference of actionReferences(source, name)) {
+              validateActionReference(reference, name);
             }
           }
 
