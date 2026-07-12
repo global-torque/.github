@@ -107,7 +107,8 @@ jobs:
           printf '%s\n' \
             'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' \
             > "${requirements}"
-          python3 -I -m pip install \
+          python3 -I -m venv "${RUNNER_TEMP}/workflow-policy-venv"
+          "${RUNNER_TEMP}/workflow-policy-venv/bin/python" -I -m pip install \
             --disable-pip-version-check \
             --no-deps \
             --only-binary=:all: \
@@ -123,13 +124,14 @@ jobs:
           )
           test "${#workflows[@]}" -gt 0
           "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
+          policy_python="${RUNNER_TEMP}/workflow-policy-venv/bin/python"
           shadow_directory="${RUNNER_TEMP}/workflow-policy-shadow"
           mkdir -p "${shadow_directory}"
           printf '%s\n' 'raise RuntimeError("checkout-local yaml.py was imported")' \
             > "${shadow_directory}/yaml.py"
           (
             cd "${shadow_directory}"
-            python3 -I - <<'PYTHON'
+            "${policy_python}" -I - <<'PYTHON'
           from pathlib import Path
 
           import yaml
@@ -140,43 +142,189 @@ jobs:
               raise RuntimeError("isolated Python did not import the installed PyYAML package")
           PYTHON
           )
-          python3 -I - <<'PYTHON'
-          from pathlib import Path
+          "${policy_python}" -I - <<'PYTHON'
+          import os
           import re
+          import shutil
+          from pathlib import Path
 
           import yaml
 
-          github_action = re.compile(
+          github_reference = re.compile(
               r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$"
           )
           docker_action = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
 
-          def validate_reference(reference: object, name: str) -> None:
-              if not isinstance(reference, str):
-                  raise ValueError(f"{name} contains a non-string action reference")
-              if reference.startswith("./"):
-                  return
-              if reference.startswith("docker://"):
-                  if docker_action.fullmatch(reference):
-                      return
-                  raise ValueError(
-                      f"{name} contains a Docker action that is not pinned by SHA-256 digest: {reference}"
-                  )
-              if github_action.fullmatch(reference):
-                  return
-              raise ValueError(
-                  f"{name} contains an invalid or non-SHA-pinned action reference: {reference}"
-              )
+          class PolicyScanner:
+              def __init__(self, repository_root: Path) -> None:
+                  self.repository_root = repository_root.resolve()
+                  self.visited: set[tuple[str, Path]] = set()
 
-          def visit(value: object, name: str) -> None:
-              if isinstance(value, dict):
-                  for key, nested in value.items():
-                      if key == "uses":
-                          validate_reference(nested, name)
-                      visit(nested, name)
-              elif isinstance(value, list):
-                  for nested in value:
-                      visit(nested, name)
+              def display_name(self, path: Path) -> str:
+                  try:
+                      return path.relative_to(self.repository_root).as_posix()
+                  except ValueError:
+                      return path.as_posix()
+
+              def load_document(self, path: Path) -> object:
+                  try:
+                      return yaml.safe_load(path.read_text(encoding="utf-8"))
+                  except (OSError, UnicodeError, yaml.YAMLError) as error:
+                      raise ValueError(
+                          f"{self.display_name(path)} could not be parsed structurally"
+                      ) from error
+
+              def resolve_local(self, reference: str, source: Path) -> Path:
+                  candidate = (self.repository_root / reference[2:]).resolve()
+                  try:
+                      candidate.relative_to(self.repository_root)
+                  except ValueError as error:
+                      raise ValueError(
+                          f"{self.display_name(source)} contains an escaping local reference: {reference}"
+                      ) from error
+                  if not candidate.exists():
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a missing local reference: {reference}"
+                      )
+                  return candidate
+
+              def validate_external(self, reference: object, source: Path) -> str:
+                  if not isinstance(reference, str):
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a non-string action reference"
+                      )
+                  if reference.startswith("docker://"):
+                      if docker_action.fullmatch(reference):
+                          return reference
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a Docker action that is not pinned by SHA-256 digest: {reference}"
+                      )
+                  if github_reference.fullmatch(reference):
+                      return reference
+                  raise ValueError(
+                      f"{self.display_name(source)} contains an invalid or non-SHA-pinned action reference: {reference}"
+                  )
+
+              def scan_reference(
+                  self,
+                  reference: object,
+                  source: Path,
+                  reference_kind: str,
+              ) -> None:
+                  if not isinstance(reference, str) or not reference.startswith("./"):
+                      self.validate_external(reference, source)
+                      return
+
+                  local_path = self.resolve_local(reference, source)
+                  if reference_kind == "workflow":
+                      if (
+                          not local_path.is_file()
+                          or local_path.suffix not in {".yml", ".yaml"}
+                          or local_path.parent
+                          != self.repository_root / ".github" / "workflows"
+                      ):
+                          raise ValueError(
+                              f"{self.display_name(source)} contains an invalid local reusable workflow: {reference}"
+                          )
+                      self.scan_workflow(local_path)
+                      return
+
+                  if not local_path.is_dir():
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a local action that is not a directory: {reference}"
+                      )
+                  metadata = [
+                      candidate
+                      for candidate in (
+                          local_path / "action.yml",
+                          local_path / "action.yaml",
+                      )
+                      if candidate.is_file()
+                  ]
+                  if len(metadata) != 1:
+                      raise ValueError(
+                          f"{self.display_name(source)} local action must contain exactly one action.yml or action.yaml: {reference}"
+                      )
+                  self.scan_action(metadata[0])
+
+              def scan_workflow_document(self, document: object, source: Path) -> None:
+                  if not isinstance(document, dict):
+                      raise ValueError(
+                          f"{self.display_name(source)} must contain a workflow mapping"
+                      )
+                  jobs = document.get("jobs", {})
+                  if not isinstance(jobs, dict):
+                      raise ValueError(
+                          f"{self.display_name(source)} jobs must be a mapping"
+                      )
+                  for job in jobs.values():
+                      if not isinstance(job, dict):
+                          continue
+                      if "uses" in job:
+                          self.scan_reference(job["uses"], source, "workflow")
+                      steps = job.get("steps", [])
+                      if not isinstance(steps, list):
+                          continue
+                      for step in steps:
+                          if isinstance(step, dict) and "uses" in step:
+                              self.scan_reference(step["uses"], source, "action")
+
+              def scan_workflow(self, path: Path) -> None:
+                  resolved = path.resolve()
+                  try:
+                      resolved.relative_to(self.repository_root)
+                  except ValueError as error:
+                      raise ValueError(
+                          f"Workflow metadata escapes the repository: {path.as_posix()}"
+                      ) from error
+                  key = ("workflow", resolved)
+                  if key in self.visited:
+                      return
+                  self.visited.add(key)
+                  self.scan_workflow_document(self.load_document(resolved), resolved)
+
+              def scan_action(self, path: Path) -> None:
+                  resolved = path.resolve()
+                  try:
+                      resolved.relative_to(self.repository_root)
+                  except ValueError as error:
+                      raise ValueError(
+                          f"Action metadata escapes the repository: {path.as_posix()}"
+                      ) from error
+                  key = ("action", resolved)
+                  if key in self.visited:
+                      return
+                  self.visited.add(key)
+                  document = self.load_document(resolved)
+                  if not isinstance(document, dict):
+                      raise ValueError(
+                          f"{self.display_name(resolved)} must contain an action mapping"
+                      )
+                  runs = document.get("runs", {})
+                  if not isinstance(runs, dict) or runs.get("using") != "composite":
+                      return
+                  steps = runs.get("steps", [])
+                  if not isinstance(steps, list):
+                      raise ValueError(
+                          f"{self.display_name(resolved)} composite steps must be a list"
+                      )
+                  for step in steps:
+                      if isinstance(step, dict) and "uses" in step:
+                          self.scan_reference(step["uses"], resolved, "action")
+
+              def scan_all_workflows(self) -> None:
+                  workflow_directory = self.repository_root / ".github" / "workflows"
+                  workflows = sorted(
+                      path
+                      for path in workflow_directory.iterdir()
+                      if path.is_file() and path.suffix in {".yml", ".yaml"}
+                  )
+                  if not workflows:
+                      raise ValueError("Repository contains no workflow files")
+                  for workflow in workflows:
+                      self.scan_workflow(workflow)
+
+          repository_scanner = PolicyScanner(Path.cwd())
 
           for bypass in (
               "- uses : actions/checkout@v4",
@@ -185,28 +333,52 @@ jobs:
               r'- "u\u0073es": actions/checkout@v4',
           ):
               try:
-                  visit(yaml.safe_load(f"steps:\n  {bypass}\n"), "policy-self-test.yml")
+                  document = yaml.safe_load(
+                      f"jobs:\n  policy:\n    steps:\n      {bypass}\n"
+                  )
+                  repository_scanner.scan_workflow_document(
+                      document, Path("policy-self-test.yml")
+                  )
               except ValueError:
                   pass
               else:
                   raise ValueError(f"Workflow policy accepted bypass: {bypass}")
 
           for reference in (
-              "./.github/actions/local",
               f"actions/checkout@{'a' * 40}",
               f"docker://alpine@sha256:{'b' * 64}",
           ):
-              validate_reference(reference, "policy-self-test.yml")
+              repository_scanner.validate_external(
+                  reference, Path("policy-self-test.yml")
+              )
 
-          workflow_directory = Path(".github/workflows")
-          for workflow in sorted(workflow_directory.iterdir()):
-              if workflow.suffix not in {".yml", ".yaml"}:
-                  continue
-              try:
-                  document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
-              except yaml.YAMLError as error:
-                  raise ValueError(f"{workflow.name} could not be parsed structurally") from error
-              visit(document, workflow.name)
+          fixture_root = Path(os.environ["RUNNER_TEMP"]) / "workflow-policy-fixtures"
+          shutil.rmtree(fixture_root, ignore_errors=True)
+          fixture_workflows = fixture_root / ".github" / "workflows"
+          fixture_action = fixture_root / ".github" / "actions" / "local"
+          fixture_workflows.mkdir(parents=True)
+          fixture_action.mkdir(parents=True)
+          (fixture_workflows / "fixture.yml").write_text(
+              """on:\n  workflow_call:\n    inputs:\n      uses:\n        type: string\nenv:\n  uses: not-an-action\njobs:\n  check:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ./.github/actions/local\n""",
+              encoding="utf-8",
+          )
+          (fixture_action / "action.yml").write_text(
+              """name: hostile-local-action\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@v4\n""",
+              encoding="utf-8",
+          )
+          try:
+              PolicyScanner(fixture_root).scan_all_workflows()
+          except ValueError:
+              pass
+          else:
+              raise ValueError("Workflow policy accepted an unpinned composite action")
+
+          (fixture_action / "action.yml").write_text(
+              f"""name: pinned-local-action\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@{'a' * 40}\n""",
+              encoding="utf-8",
+          )
+          PolicyScanner(fixture_root).scan_all_workflows()
+          repository_scanner.scan_all_workflows()
           PYTHON
           node <<'NODE'
           const fs = require('node:fs');
@@ -254,9 +426,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned REUSE tool
-        run: python3 -I -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -m venv "${RUNNER_TEMP}/reuse-venv"
+          "${RUNNER_TEMP}/reuse-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check \
+            'reuse[charset-normalizer]==6.2.0'
       - name: Validate licensing metadata
-        run: reuse lint
+        run: |
+          "${RUNNER_TEMP}/reuse-venv/bin/python" -I -m reuse lint
 
   dco:
     name: DCO sign-off
