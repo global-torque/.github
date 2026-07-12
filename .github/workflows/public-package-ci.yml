@@ -99,6 +99,20 @@ jobs:
           echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${archive}" \
             | sha256sum --check --strict
           tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" actionlint
+      - name: Install hash-locked YAML parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          requirements="${RUNNER_TEMP}/workflow-policy-requirements.txt"
+          printf '%s\n' \
+            'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' \
+            > "${requirements}"
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement "${requirements}"
       - name: Validate workflow syntax and pinned actions
         shell: bash
         run: |
@@ -109,97 +123,79 @@ jobs:
           )
           test "${#workflows[@]}" -gt 0
           "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
+          python3 <<'PYTHON'
+          from pathlib import Path
+          import re
+
+          import yaml
+
+          github_action = re.compile(
+              r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$"
+          )
+          docker_action = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
+
+          def validate_reference(reference: object, name: str) -> None:
+              if not isinstance(reference, str):
+                  raise ValueError(f"{name} contains a non-string action reference")
+              if reference.startswith("./"):
+                  return
+              if reference.startswith("docker://"):
+                  if docker_action.fullmatch(reference):
+                      return
+                  raise ValueError(
+                      f"{name} contains a Docker action that is not pinned by SHA-256 digest: {reference}"
+                  )
+              if github_action.fullmatch(reference):
+                  return
+              raise ValueError(
+                  f"{name} contains an invalid or non-SHA-pinned action reference: {reference}"
+              )
+
+          def visit(value: object, name: str) -> None:
+              if isinstance(value, dict):
+                  for key, nested in value.items():
+                      if key == "uses":
+                          validate_reference(nested, name)
+                      visit(nested, name)
+              elif isinstance(value, list):
+                  for nested in value:
+                      visit(nested, name)
+
+          for bypass in (
+              "- uses : actions/checkout@v4",
+              '- "uses": actions/checkout@v4',
+              "- { uses: actions/checkout@v4 }",
+              r'- "u\u0073es": actions/checkout@v4',
+          ):
+              try:
+                  visit(yaml.safe_load(f"steps:\n  {bypass}\n"), "policy-self-test.yml")
+              except ValueError:
+                  pass
+              else:
+                  raise ValueError(f"Workflow policy accepted bypass: {bypass}")
+
+          for reference in (
+              "./.github/actions/local",
+              f"actions/checkout@{'a' * 40}",
+              f"docker://alpine@sha256:{'b' * 64}",
+          ):
+              validate_reference(reference, "policy-self-test.yml")
+
+          workflow_directory = Path(".github/workflows")
+          for workflow in sorted(workflow_directory.iterdir()):
+              if workflow.suffix not in {".yml", ".yaml"}:
+                  continue
+              try:
+                  document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+              except yaml.YAMLError as error:
+                  raise ValueError(f"{workflow.name} could not be parsed structurally") from error
+              visit(document, workflow.name)
+          PYTHON
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
 
-          const canonicalUses = /^\s*(?:-\s*)?uses:\s*(\S+?)(?:\s+#.*)?$/;
-          const anyUsesKey = /(?:^\s*|[-{,]\s*)(?:"uses"|'uses'|uses)\s*:/;
-          const blockScalar = /:\s*[|>][+-]?\d?\s*(?:#.*)?$/;
-          const actionReferences = (source, name) => {
-            const references = [];
-            let blockIndent = null;
-            for (const [index, line] of source.split(/\r?\n/u).entries()) {
-              const trimmed = line.trim();
-              const indentation = line.length - line.trimStart().length;
-              if (blockIndent !== null) {
-                if (trimmed === '' || indentation > blockIndent) continue;
-                blockIndent = null;
-              }
-              if (blockScalar.test(line)) {
-                blockIndent = indentation;
-                continue;
-              }
-              if (!anyUsesKey.test(line)) continue;
-              const match = canonicalUses.exec(line);
-              if (!match) {
-                throw new Error(
-                  `${name}:${index + 1} uses a non-canonical action key; use an unquoted "uses:" key on its own line.`,
-                );
-              }
-              let reference = match[1];
-              if (
-                (reference.startsWith('"') && reference.endsWith('"')) ||
-                (reference.startsWith("'") && reference.endsWith("'"))
-              ) {
-                reference = reference.slice(1, -1);
-              }
-              references.push(reference);
-            }
-            return references;
-          };
-          const validateActionReference = (reference, name) => {
-            if (reference.startsWith('./')) return;
-            if (reference.startsWith('docker://')) {
-              if (/^docker:\/\/[^@\s]+@sha256:[0-9a-f]{64}$/.test(reference)) {
-                return;
-              }
-              throw new Error(
-                `${name} contains a Docker action that is not pinned by SHA-256 digest: ${reference}`,
-              );
-            }
-            if (
-              /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$/.test(
-                reference,
-              )
-            ) {
-              return;
-            }
-            throw new Error(
-              `${name} contains an invalid or non-SHA-pinned action reference: ${reference}`,
-            );
-          };
-
-          for (const bypass of [
-            '- uses : actions/checkout@v4',
-            '- "uses": actions/checkout@v4',
-            '- { uses: actions/checkout@v4 }',
-          ]) {
-            let rejected = false;
-            try {
-              actionReferences(`steps:\n  ${bypass}\n`, 'policy-self-test.yml');
-            } catch {
-              rejected = true;
-            }
-            if (!rejected) throw new Error(`Workflow policy accepted bypass: ${bypass}`);
-          }
-          for (const reference of [
-            './.github/actions/local',
-            `actions/checkout@${'a'.repeat(40)}`,
-            `docker://alpine@sha256:${'b'.repeat(64)}`,
-          ]) {
-            validateActionReference(reference, 'policy-self-test.yml');
-          }
-
           const workflowDirectory = path.join('.github', 'workflows');
-          for (const name of fs.readdirSync(workflowDirectory)) {
-            if (!name.endsWith('.yml') && !name.endsWith('.yaml')) continue;
-            const source = fs.readFileSync(path.join(workflowDirectory, name), 'utf8');
-            for (const reference of actionReferences(source, name)) {
-              validateActionReference(reference, name);
-            }
-          }
-
           const candidate = fs.readFileSync(
             path.join(workflowDirectory, 'candidate.yml'),
             'utf8',
