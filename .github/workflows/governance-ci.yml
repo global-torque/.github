@@ -43,6 +43,6 @@ jobs:
           test "${#workflows[@]}" -gt 0
           "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
       - name: Install pinned REUSE tool
-        run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
+        run: python3 -I -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
       - name: Validate licensing metadata
         run: reuse lint

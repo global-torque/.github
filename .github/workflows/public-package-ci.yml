@@ -107,7 +107,7 @@ jobs:
           printf '%s\n' \
             'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' \
             > "${requirements}"
-          python3 -m pip install \
+          python3 -I -m pip install \
             --disable-pip-version-check \
             --no-deps \
             --only-binary=:all: \
@@ -123,7 +123,24 @@ jobs:
           )
           test "${#workflows[@]}" -gt 0
           "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
-          python3 <<'PYTHON'
+          shadow_directory="${RUNNER_TEMP}/workflow-policy-shadow"
+          mkdir -p "${shadow_directory}"
+          printf '%s\n' 'raise RuntimeError("checkout-local yaml.py was imported")' \
+            > "${shadow_directory}/yaml.py"
+          (
+            cd "${shadow_directory}"
+            python3 -I - <<'PYTHON'
+          from pathlib import Path
+
+          import yaml
+
+          if Path(yaml.__file__).resolve().parent == Path.cwd():
+              raise RuntimeError("isolated Python imported checkout-local yaml.py")
+          if not callable(getattr(yaml, "safe_load", None)):
+              raise RuntimeError("isolated Python did not import the installed PyYAML package")
+          PYTHON
+          )
+          python3 -I - <<'PYTHON'
           from pathlib import Path
           import re
 
@@ -237,7 +254,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned REUSE tool
-        run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
+        run: python3 -I -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
       - name: Validate licensing metadata
         run: reuse lint
 
