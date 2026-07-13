@@ -1,0 +1,72 @@
+name: Governance CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Actionlint and REUSE
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install verified actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "${archive}" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${archive}" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" actionlint
+      - name: Validate workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' workflows < <(
+            find .github/workflows -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) -print0 | sort -z
+          )
+          test "${#workflows[@]}" -gt 0
+          "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
+      - name: Install hash-locked policy parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          requirements="${RUNNER_TEMP}/workflow-policy-requirements.txt"
+          printf '%s\n' \
+            'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' \
+            > "${requirements}"
+          python3 -I -m venv "${RUNNER_TEMP}/workflow-policy-venv"
+          "${RUNNER_TEMP}/workflow-policy-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement "${requirements}"
+      - name: Exercise embedded workflow and DCO policy
+        run: |
+          node scripts/run-governance-self-tests.mjs \
+            "${RUNNER_TEMP}/workflow-policy-venv/bin/python"
+      - name: Validate licensing metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/data:ro" \
+            --workdir /data \
+            docker.io/fsfe/reuse@sha256:85462a75c0f8efda09ddd190b92816b70e7662577c8427429e11e1b9f25a992e \
+            lint

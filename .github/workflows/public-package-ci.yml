@@ -2,6 +2,12 @@ name: Reusable public package CI
 
 on:
   workflow_call:
+    inputs:
+      install-browser:
+        description: Install the package's pinned browser before running CI.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,9 +37,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm --config.ignore-pnpmfile=true install --frozen-lockfile --ignore-scripts
+      - name: Install browser test runtime
+        if: inputs.install-browser
+        run: pnpm run browser:install
       - name: Run release-grade package checks
-        run: pnpm run ci
+        run: pnpm --config.enable-pre-post-scripts=false run ci
 
   informational-node-26:
     name: Node 26 informational
@@ -54,9 +63,12 @@ jobs:
           node-version: 26.5.0
           cache: pnpm
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm --config.ignore-pnpmfile=true install --frozen-lockfile --ignore-scripts
+      - name: Install browser test runtime
+        if: inputs.install-browser
+        run: pnpm run browser:install
       - name: Run package checks
-        run: pnpm run ci
+        run: pnpm --config.enable-pre-post-scripts=false run ci
 
   dependency-review:
     name: Dependency review
@@ -67,6 +79,808 @@ jobs:
     steps:
       - name: Review dependency changes
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+
+  workflow-policy:
+    name: Workflow policy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install verified actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/actionlint.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "${archive}" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${archive}" \
+            | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${RUNNER_TEMP}" actionlint
+      - name: Install hash-locked YAML parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          requirements="${RUNNER_TEMP}/workflow-policy-requirements.txt"
+          printf '%s\n' \
+            'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' \
+            > "${requirements}"
+          python3 -I -m venv "${RUNNER_TEMP}/workflow-policy-venv"
+          "${RUNNER_TEMP}/workflow-policy-venv/bin/python" -I -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement "${requirements}"
+      - name: Validate workflow syntax and pinned actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' workflows < <(
+            find .github/workflows -maxdepth 1 -type f \
+              \( -name '*.yml' -o -name '*.yaml' \) -print0 | sort -z
+          )
+          test "${#workflows[@]}" -gt 0
+          "${RUNNER_TEMP}/actionlint" "${workflows[@]}"
+          policy_python="${RUNNER_TEMP}/workflow-policy-venv/bin/python"
+          shadow_directory="${RUNNER_TEMP}/workflow-policy-shadow"
+          mkdir -p "${shadow_directory}"
+          printf '%s\n' 'raise RuntimeError("checkout-local yaml.py was imported")' \
+            > "${shadow_directory}/yaml.py"
+          (
+            cd "${shadow_directory}"
+            "${policy_python}" -I - <<'PYTHON'
+          from pathlib import Path
+
+          import yaml
+
+          if Path(yaml.__file__).resolve().parent == Path.cwd():
+              raise RuntimeError("isolated Python imported checkout-local yaml.py")
+          if not callable(getattr(yaml, "safe_load", None)):
+              raise RuntimeError("isolated Python did not import the installed PyYAML package")
+          PYTHON
+          )
+          "${policy_python}" -I - <<'PYTHON'
+          import copy
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          import yaml
+
+          github_reference = re.compile(
+              r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$"
+          )
+          docker_action = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
+
+          class PolicyScanner:
+              def __init__(self, repository_root: Path) -> None:
+                  self.repository_root = repository_root.resolve()
+                  self.visited: set[tuple[str, Path]] = set()
+
+              def display_name(self, path: Path) -> str:
+                  try:
+                      return path.relative_to(self.repository_root).as_posix()
+                  except ValueError:
+                      return path.as_posix()
+
+              def load_document(self, path: Path) -> object:
+                  try:
+                      return yaml.safe_load(path.read_text(encoding="utf-8"))
+                  except (OSError, UnicodeError, yaml.YAMLError) as error:
+                      raise ValueError(
+                          f"{self.display_name(path)} could not be parsed structurally"
+                      ) from error
+
+              def resolve_local(self, reference: str, source: Path) -> Path:
+                  candidate = (self.repository_root / reference[2:]).resolve()
+                  try:
+                      candidate.relative_to(self.repository_root)
+                  except ValueError as error:
+                      raise ValueError(
+                          f"{self.display_name(source)} contains an escaping local reference: {reference}"
+                      ) from error
+                  if not candidate.exists():
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a missing local reference: {reference}"
+                      )
+                  return candidate
+
+              def validate_external(self, reference: object, source: Path) -> str:
+                  if not isinstance(reference, str):
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a non-string action reference"
+                      )
+                  if reference.startswith("docker://"):
+                      if docker_action.fullmatch(reference):
+                          return reference
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a Docker action that is not pinned by SHA-256 digest: {reference}"
+                      )
+                  if github_reference.fullmatch(reference):
+                      return reference
+                  raise ValueError(
+                      f"{self.display_name(source)} contains an invalid or non-SHA-pinned action reference: {reference}"
+                  )
+
+              def scan_reference(
+                  self,
+                  reference: object,
+                  source: Path,
+                  reference_kind: str,
+              ) -> None:
+                  if not isinstance(reference, str) or not reference.startswith("./"):
+                      self.validate_external(reference, source)
+                      return
+
+                  local_path = self.resolve_local(reference, source)
+                  if reference_kind == "workflow":
+                      if (
+                          not local_path.is_file()
+                          or local_path.suffix not in {".yml", ".yaml"}
+                          or local_path.parent
+                          != self.repository_root / ".github" / "workflows"
+                      ):
+                          raise ValueError(
+                              f"{self.display_name(source)} contains an invalid local reusable workflow: {reference}"
+                          )
+                      self.scan_workflow(local_path)
+                      return
+
+                  if not local_path.is_dir():
+                      raise ValueError(
+                          f"{self.display_name(source)} contains a local action that is not a directory: {reference}"
+                      )
+                  metadata = [
+                      candidate
+                      for candidate in (
+                          local_path / "action.yml",
+                          local_path / "action.yaml",
+                      )
+                      if candidate.is_file()
+                  ]
+                  if len(metadata) != 1:
+                      raise ValueError(
+                          f"{self.display_name(source)} local action must contain exactly one action.yml or action.yaml: {reference}"
+                      )
+                  self.scan_action(metadata[0])
+
+              def scan_workflow_document(self, document: object, source: Path) -> None:
+                  if not isinstance(document, dict):
+                      raise ValueError(
+                          f"{self.display_name(source)} must contain a workflow mapping"
+                      )
+                  jobs = document.get("jobs", {})
+                  if not isinstance(jobs, dict):
+                      raise ValueError(
+                          f"{self.display_name(source)} jobs must be a mapping"
+                      )
+                  for job in jobs.values():
+                      if not isinstance(job, dict):
+                          continue
+                      if "uses" in job:
+                          self.scan_reference(job["uses"], source, "workflow")
+                      steps = job.get("steps", [])
+                      if not isinstance(steps, list):
+                          continue
+                      for step in steps:
+                          if isinstance(step, dict) and "uses" in step:
+                              self.scan_reference(step["uses"], source, "action")
+
+              def scan_workflow(self, path: Path) -> None:
+                  resolved = path.resolve()
+                  try:
+                      resolved.relative_to(self.repository_root)
+                  except ValueError as error:
+                      raise ValueError(
+                          f"Workflow metadata escapes the repository: {path.as_posix()}"
+                      ) from error
+                  key = ("workflow", resolved)
+                  if key in self.visited:
+                      return
+                  self.visited.add(key)
+                  self.scan_workflow_document(self.load_document(resolved), resolved)
+
+              def scan_action(self, path: Path) -> None:
+                  resolved = path.resolve()
+                  try:
+                      resolved.relative_to(self.repository_root)
+                  except ValueError as error:
+                      raise ValueError(
+                          f"Action metadata escapes the repository: {path.as_posix()}"
+                      ) from error
+                  key = ("action", resolved)
+                  if key in self.visited:
+                      return
+                  self.visited.add(key)
+                  document = self.load_document(resolved)
+                  if not isinstance(document, dict):
+                      raise ValueError(
+                          f"{self.display_name(resolved)} must contain an action mapping"
+                      )
+                  runs = document.get("runs", {})
+                  if not isinstance(runs, dict):
+                      return
+                  raw_using = runs.get("using")
+                  if not isinstance(raw_using, str):
+                      raise ValueError(
+                          f"{self.display_name(resolved)} contains a non-string runs.using value"
+                      )
+                  using = raw_using.casefold()
+                  if using == "docker":
+                      image = runs.get("image")
+                      if not isinstance(image, str):
+                          raise ValueError(
+                              f"{self.display_name(resolved)} contains a non-string Docker image"
+                          )
+                      if image.casefold().startswith("docker://"):
+                          normalized_image = f"docker://{image[len('docker://'):]}"
+                          self.validate_external(normalized_image, resolved)
+                          return
+                      raise ValueError(
+                          f"{self.display_name(resolved)} uses a local Dockerfile action; only digest-pinned docker:// images are permitted"
+                      )
+                  if using != "composite":
+                      return
+                  steps = runs.get("steps", [])
+                  if not isinstance(steps, list):
+                      raise ValueError(
+                          f"{self.display_name(resolved)} composite steps must be a list"
+                      )
+                  for step in steps:
+                      if isinstance(step, dict) and "uses" in step:
+                          self.scan_reference(step["uses"], resolved, "action")
+
+              def scan_all_workflows(self) -> None:
+                  workflow_directory = self.repository_root / ".github" / "workflows"
+                  workflows = sorted(
+                      path
+                      for path in workflow_directory.iterdir()
+                      if path.is_file() and path.suffix in {".yml", ".yaml"}
+                  )
+                  if not workflows:
+                      raise ValueError("Repository contains no workflow files")
+                  for workflow in workflows:
+                      self.scan_workflow(workflow)
+
+          def require_policy(condition: bool, message: str) -> None:
+              if not condition:
+                  raise ValueError(message)
+
+          def github_expression(value: str) -> str:
+              return "${" + "{ " + value + " }}"
+
+          def normalized_workflow(document: object, source: str) -> dict:
+              require_policy(isinstance(document, dict), f"{source} must be a mapping")
+              normalized = {
+                  "on" if key is True else key: value
+                  for key, value in document.items()
+              }
+              require_policy(
+                  set(normalized) == {"name", "on", "permissions", "jobs"},
+                  f"{source} contains unexpected or missing top-level keys",
+              )
+              return normalized
+
+          def require_keys(value: object, expected: set[str], label: str) -> dict:
+              require_policy(isinstance(value, dict), f"{label} must be a mapping")
+              require_policy(set(value) == expected, f"{label} has an unexpected shape")
+              return value
+
+          def require_action_step(
+              step: object,
+              repository: str,
+              inputs: dict,
+              label: str,
+          ) -> None:
+              candidate = require_keys(step, {"name", "uses", "with"}, label)
+              reference = candidate["uses"]
+              require_policy(
+                  isinstance(reference, str)
+                  and reference.rsplit("@", 1)[0] == repository,
+                  f"{label} must use {repository} at a pinned commit",
+              )
+              require_policy(candidate["with"] == inputs, f"{label} inputs changed")
+
+          def require_run_step(
+              step: object,
+              expected_lines: tuple[str, ...],
+              label: str,
+              *,
+              shell: bool = False,
+              step_id: str | None = None,
+              environment: dict | None = None,
+          ) -> None:
+              keys = {"name", "run"}
+              if shell:
+                  keys.add("shell")
+              if step_id is not None:
+                  keys.add("id")
+              if environment is not None:
+                  keys.add("env")
+              candidate = require_keys(step, keys, label)
+              if shell:
+                  require_policy(candidate["shell"] == "bash", f"{label} must use bash")
+              if step_id is not None:
+                  require_policy(candidate["id"] == step_id, f"{label} ID changed")
+              if environment is not None:
+                  require_policy(candidate["env"] == environment, f"{label} environment changed")
+              expected_run = (
+                  "\n".join(expected_lines) + "\n"
+                  if shell
+                  else expected_lines[0]
+              )
+              require_policy(candidate["run"] == expected_run, f"{label} commands changed")
+
+          VERIFY_TAG_COMMANDS = (
+              "set -euo pipefail",
+              "git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main",
+              'test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"',
+              'test "$(git rev-parse origin/main)" = "${GITHUB_SHA}"',
+              'test "v$(node -p "require(\'./package.json\').version")" = "${GITHUB_REF_NAME}"',
+              "pnpm --config.ignore-pnpmfile=true install --frozen-lockfile --ignore-scripts",
+          )
+          PACK_COMMANDS = (
+              "set -euo pipefail",
+              "rm -rf release",
+              "mkdir release",
+              "pnpm --config.ignore-scripts=true --config.ignore-pnpmfile=true pack --pack-destination release",
+              "node scripts/create-release-manifest.mjs release",
+          )
+          CHECKSUM_COMMANDS = (
+              "set -euo pipefail",
+              "shopt -s nullglob",
+              "checksums=(release/*.tgz.sha512)",
+              'test "${#checksums[@]}" -eq 1',
+              "printf 'checksums=%s\\n' \"${checksums[0]}\" >> \"${GITHUB_OUTPUT}\"",
+          )
+          DOWNLOAD_ATTESTATION_COMMANDS = (
+              "set -euo pipefail",
+              "artifact=$(find release -maxdepth 1 -name '*.tgz' -print -quit)",
+              "for attempt in 1 2 3 4 5; do",
+              '  if (cd release && gh attestation download "$(basename "${artifact}")" --repo "${GITHUB_REPOSITORY}" --digest-alg sha512); then',
+              "    exit 0",
+              "  fi",
+              "  printf 'attestation bundle not available (attempt %s/5)\\n' \"${attempt}\" >&2",
+              "  sleep 5",
+              "done",
+              "exit 1",
+          )
+          VERIFY_ATTESTATION_COMMANDS = (
+              "set -euo pipefail",
+              "shopt -s nullglob",
+              "artifacts=(release/*.tgz)",
+              "bundles=(release/sha512:*.jsonl release/sha512-*.jsonl)",
+              'test "${#artifacts[@]}" -eq 1',
+              'test "${#bundles[@]}" -eq 1',
+              'gh attestation verify "${artifacts[0]}" \\',
+              '  --bundle "${bundles[0]}" \\',
+              '  --repo "${GITHUB_REPOSITORY}" \\',
+              "  --digest-alg sha512 \\",
+              '  --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/candidate.yml" \\',
+              '  --signer-digest "${GITHUB_SHA}" \\',
+              '  --source-digest "${GITHUB_SHA}" \\',
+              '  --source-ref "${GITHUB_REF}" \\',
+              "  --deny-self-hosted-runners \\",
+              "  --format json > /dev/null",
+          )
+          DRAFT_RELEASE_COMMANDS = (
+              "set -euo pipefail",
+              'version=$(node -p "require(\'./package.json\').version")',
+              'test "v${version}" = "${GITHUB_REF_NAME}"',
+              'gh release create "${GITHUB_REF_NAME}" release/* \\',
+              "  --draft \\",
+              "  --prerelease \\",
+              "  --verify-tag \\",
+              '  --title "${GITHUB_REF_NAME}" \\',
+              '  --notes "Immutable candidate from ${GITHUB_SHA}. Publish this draft only after the named real-consumer gate and public release issue are complete."',
+          )
+
+          def validate_candidate_document(document: object, source: str) -> None:
+              workflow = normalized_workflow(document, source)
+              require_policy(
+                  workflow["on"]
+                  == {"push": {"tags": ["v*"]}, "workflow_dispatch": None},
+                  f"{source} must run only for v* tags or explicit dispatch",
+              )
+              require_policy(
+                  workflow["permissions"] == {"contents": "read"},
+                  f"{source} default permissions changed",
+              )
+              jobs = require_keys(
+                  workflow["jobs"],
+                  {"build", "clean-room", "draft-prerelease"},
+                  f"{source} jobs",
+              )
+
+              build = require_keys(
+                  jobs["build"],
+                  {"name", "if", "runs-on", "permissions", "steps"},
+                  f"{source} build job",
+              )
+              require_policy(
+                  build["if"]
+                  == "github.ref_type == 'tag' && startsWith(github.ref_name, 'v')",
+                  f"{source} build tag guard changed",
+              )
+              require_policy(build["runs-on"] == "ubuntu-24.04", f"{source} build runner changed")
+              require_policy(
+                  build["permissions"]
+                  == {
+                      "artifact-metadata": "write",
+                      "attestations": "write",
+                      "contents": "read",
+                      "id-token": "write",
+                  },
+                  f"{source} build permissions changed",
+              )
+              steps = build["steps"]
+              require_policy(isinstance(steps, list), f"{source} build steps must be a list")
+              cursor = 0
+              require_action_step(
+                  steps[cursor],
+                  "actions/checkout",
+                  {"fetch-depth": 0, "persist-credentials": False},
+                  f"{source} protected checkout",
+              )
+              cursor += 1
+              require_action_step(
+                  steps[cursor],
+                  "pnpm/action-setup",
+                  {"run_install": False},
+                  f"{source} pnpm setup",
+              )
+              cursor += 1
+              require_action_step(
+                  steps[cursor],
+                  "actions/setup-node",
+                  {"node-version": "24.18.0", "cache": "pnpm"},
+                  f"{source} Node setup",
+              )
+              cursor += 1
+              require_run_step(
+                  steps[cursor], VERIFY_TAG_COMMANDS, f"{source} tag verification", shell=True
+              )
+              cursor += 1
+              if (
+                  isinstance(steps[cursor], dict)
+                  and steps[cursor].get("run") == "pnpm run browser:install"
+              ):
+                  require_run_step(
+                      steps[cursor],
+                      ("pnpm run browser:install",),
+                      f"{source} browser setup",
+                  )
+                  cursor += 1
+              require_run_step(
+                  steps[cursor],
+                  ("pnpm --config.enable-pre-post-scripts=false run ci",),
+                  f"{source} package gates",
+              )
+              cursor += 1
+              require_run_step(steps[cursor], PACK_COMMANDS, f"{source} package pack", shell=True)
+              cursor += 1
+              require_run_step(
+                  steps[cursor],
+                  CHECKSUM_COMMANDS,
+                  f"{source} checksum selection",
+                  shell=True,
+                  step_id="subject",
+              )
+              cursor += 1
+              require_action_step(
+                  steps[cursor],
+                  "actions/attest",
+                  {"subject-checksums": github_expression("steps.subject.outputs.checksums")},
+                  f"{source} attestation",
+              )
+              cursor += 1
+              require_run_step(
+                  steps[cursor],
+                  DOWNLOAD_ATTESTATION_COMMANDS,
+                  f"{source} attestation download",
+                  shell=True,
+                  environment={"GH_TOKEN": github_expression("github.token")},
+              )
+              cursor += 1
+              require_run_step(
+                  steps[cursor],
+                  VERIFY_ATTESTATION_COMMANDS,
+                  f"{source} attestation verification",
+                  shell=True,
+                  environment={"GH_TOKEN": github_expression("github.token")},
+              )
+              cursor += 1
+              require_action_step(
+                  steps[cursor],
+                  "actions/upload-artifact",
+                  {
+                      "name": "candidate-" + github_expression("github.sha"),
+                      "path": "release/*",
+                      "if-no-files-found": "error",
+                      "retention-days": 90,
+                  },
+                  f"{source} artifact retention",
+              )
+              cursor += 1
+              require_policy(cursor == len(steps), f"{source} build has extra steps")
+
+              clean = require_keys(
+                  jobs["clean-room"],
+                  {"name", "needs", "runs-on", "strategy", "steps"},
+                  f"{source} clean-room job",
+              )
+              require_policy(clean["needs"] == "build", f"{source} clean-room dependency changed")
+              require_policy(clean["runs-on"] == "ubuntu-24.04", f"{source} clean-room runner changed")
+              require_policy(
+                  clean["strategy"]
+                  == {
+                      "fail-fast": False,
+                      "matrix": {
+                          "manager": ["npm", "pnpm"],
+                          "node": ["22.23.1", "24.18.0"],
+                      },
+                  },
+                  f"{source} clean-room matrix changed",
+              )
+              clean_steps = clean["steps"]
+              require_policy(isinstance(clean_steps, list) and len(clean_steps) == 5, f"{source} clean-room steps changed")
+              require_action_step(
+                  clean_steps[0],
+                  "actions/checkout",
+                  {"persist-credentials": False},
+                  f"{source} clean-room checkout",
+              )
+              require_action_step(
+                  clean_steps[1],
+                  "pnpm/action-setup",
+                  {"run_install": False},
+                  f"{source} clean-room pnpm setup",
+              )
+              require_action_step(
+                  clean_steps[2],
+                  "actions/setup-node",
+                  {"node-version": github_expression("matrix.node")},
+                  f"{source} clean-room Node setup",
+              )
+              require_action_step(
+                  clean_steps[3],
+                  "actions/download-artifact",
+                  {
+                      "name": "candidate-" + github_expression("github.sha"),
+                      "path": "release",
+                  },
+                  f"{source} clean-room artifact download",
+              )
+              require_run_step(
+                  clean_steps[4],
+                  (
+                      'node scripts/verify-installed-artifact.mjs release "'
+                      + github_expression("matrix.manager")
+                      + '"',
+                  ),
+                  f"{source} clean-room verification",
+              )
+
+              draft = require_keys(
+                  jobs["draft-prerelease"],
+                  {"name", "needs", "runs-on", "permissions", "steps"},
+                  f"{source} draft job",
+              )
+              require_policy(
+                  draft["needs"] == ["build", "clean-room"],
+                  f"{source} draft dependencies changed",
+              )
+              require_policy(draft["runs-on"] == "ubuntu-24.04", f"{source} draft runner changed")
+              require_policy(
+                  draft["permissions"] == {"contents": "write"},
+                  f"{source} draft permissions changed",
+              )
+              draft_steps = draft["steps"]
+              require_policy(isinstance(draft_steps, list) and len(draft_steps) == 3, f"{source} draft steps changed")
+              require_action_step(
+                  draft_steps[0],
+                  "actions/checkout",
+                  {"persist-credentials": False},
+                  f"{source} draft checkout",
+              )
+              require_action_step(
+                  draft_steps[1],
+                  "actions/download-artifact",
+                  {
+                      "name": "candidate-" + github_expression("github.sha"),
+                      "path": "release",
+                  },
+                  f"{source} draft artifact download",
+              )
+              require_run_step(
+                  draft_steps[2],
+                  DRAFT_RELEASE_COMMANDS,
+                  f"{source} draft release",
+                  shell=True,
+                  environment={"GH_TOKEN": github_expression("github.token")},
+              )
+
+          repository_scanner = PolicyScanner(Path.cwd())
+
+          for bypass in (
+              "- uses : actions/checkout@v4",
+              '- "uses": actions/checkout@v4',
+              "- { uses: actions/checkout@v4 }",
+              r'- "u\u0073es": actions/checkout@v4',
+          ):
+              try:
+                  document = yaml.safe_load(
+                      f"jobs:\n  policy:\n    steps:\n      {bypass}\n"
+                  )
+                  repository_scanner.scan_workflow_document(
+                      document, Path("policy-self-test.yml")
+                  )
+              except ValueError:
+                  pass
+              else:
+                  raise ValueError(f"Workflow policy accepted bypass: {bypass}")
+
+          for reference in (
+              f"actions/checkout@{'a' * 40}",
+              f"docker://alpine@sha256:{'b' * 64}",
+          ):
+              repository_scanner.validate_external(
+                  reference, Path("policy-self-test.yml")
+              )
+
+          fixture_root = Path(os.environ["RUNNER_TEMP"]) / "workflow-policy-fixtures"
+          shutil.rmtree(fixture_root, ignore_errors=True)
+          fixture_workflows = fixture_root / ".github" / "workflows"
+          fixture_action = fixture_root / ".github" / "actions" / "local"
+          fixture_workflows.mkdir(parents=True)
+          fixture_action.mkdir(parents=True)
+          (fixture_workflows / "fixture.yml").write_text(
+              """on:\n  workflow_call:\n    inputs:\n      uses:\n        type: string\nenv:\n  uses: not-an-action\njobs:\n  check:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ./.github/actions/local\n""",
+              encoding="utf-8",
+          )
+          (fixture_action / "action.yml").write_text(
+              """name: hostile-local-action\nruns:\n  using: Composite\n  steps:\n    - uses: actions/checkout@v4\n""",
+              encoding="utf-8",
+          )
+          try:
+              PolicyScanner(fixture_root).scan_all_workflows()
+          except ValueError:
+              pass
+          else:
+              raise ValueError("Workflow policy accepted an unpinned composite action")
+
+          (fixture_action / "action.yml").write_text(
+              f"""name: pinned-local-action\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@{'a' * 40}\n""",
+              encoding="utf-8",
+          )
+          PolicyScanner(fixture_root).scan_all_workflows()
+          (fixture_action / "action.yml").write_text(
+              """name: hostile-docker-action\nruns:\n  using: Docker\n  image: DOCKER://alpine:latest\n""",
+              encoding="utf-8",
+          )
+          decoy_directory = fixture_action / "DOCKER:"
+          decoy_directory.mkdir()
+          (decoy_directory / "alpine:latest").write_text(
+              "not a Dockerfile\n",
+              encoding="utf-8",
+          )
+          try:
+              PolicyScanner(fixture_root).scan_all_workflows()
+          except ValueError:
+              pass
+          else:
+              raise ValueError("Workflow policy accepted a mutable local Docker action")
+
+          (fixture_action / "action.yml").write_text(
+              f"""name: pinned-docker-action\nruns:\n  using: docker\n  image: docker://alpine@sha256:{'b' * 64}\n""",
+              encoding="utf-8",
+          )
+          PolicyScanner(fixture_root).scan_all_workflows()
+          (fixture_action / "Dockerfile").write_text(
+              "FROM alpine:latest\n",
+              encoding="utf-8",
+          )
+          (fixture_action / "action.yml").write_text(
+              """name: local-docker-action\nruns:\n  using: docker\n  image: Dockerfile\n""",
+              encoding="utf-8",
+          )
+          try:
+              PolicyScanner(fixture_root).scan_all_workflows()
+          except ValueError:
+              pass
+          else:
+              raise ValueError("Workflow policy accepted a local Dockerfile action")
+          repository_scanner.scan_all_workflows()
+          candidate_path = Path(".github/workflows/candidate.yml")
+          candidate_document = repository_scanner.load_document(candidate_path)
+          validate_candidate_document(candidate_document, candidate_path.as_posix())
+
+          def expect_candidate_rejected(candidate: object, description: str) -> None:
+              try:
+                  validate_candidate_document(candidate, "candidate-policy-self-test.yml")
+              except ValueError:
+                  return
+              raise ValueError(f"Candidate policy accepted {description}")
+
+          comment_decoy = yaml.safe_load(
+              """name: harmless\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  harmless:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo harmless\n# tags: v* artifact-metadata: write fetch-depth: 0\n# gh attestation verify --digest-alg sha512 --deny-self-hosted-runners\n"""
+          )
+          expect_candidate_rejected(comment_decoy, "comment-only release markers")
+
+          environment_decoy = copy.deepcopy(candidate_document)
+          environment_decoy["env"] = {
+              "RELEASE_POLICY_DECOY": "gh attestation verify --digest-alg sha512"
+          }
+          expect_candidate_rejected(environment_decoy, "environment-string release markers")
+
+          dead_step_decoy = copy.deepcopy(candidate_document)
+          dead_step_decoy["jobs"]["build"]["steps"].append(
+              {
+                  "name": "Policy marker decoy",
+                  "run": "echo 'git fetch origin/main; gh attestation verify --deny-self-hosted-runners'",
+              }
+          )
+          expect_candidate_rejected(dead_step_decoy, "an unrelated marker echo step")
+
+          continuation_comment_decoy = copy.deepcopy(candidate_document)
+          continued_command = (
+              'gh attestation verify "${artifacts[0]}" ' + chr(92) + "\n"
+          )
+          for step in continuation_comment_decoy["jobs"]["build"]["steps"]:
+              run = step.get("run") if isinstance(step, dict) else None
+              if isinstance(run, str) and continued_command in run:
+                  step["run"] = run.replace(
+                      continued_command,
+                      continued_command + "# truncate continued verification options\n",
+                      1,
+                  )
+                  break
+          else:
+              raise ValueError("Candidate self-test could not locate continued gh command")
+          expect_candidate_rejected(
+              continuation_comment_decoy,
+              "a continuation-breaking comment",
+          )
+
+          rebuild_decoy = copy.deepcopy(candidate_document)
+          for step in rebuild_decoy["jobs"]["build"]["steps"]:
+              run = step.get("run") if isinstance(step, dict) else None
+              if isinstance(run, str) and "pack --pack-destination release" in run:
+                  step["run"] = run.replace(
+                      "rm -rf release\n",
+                      "rm -rf dist release\npnpm run build\n",
+                      1,
+                  )
+                  break
+          else:
+              raise ValueError("Candidate self-test could not locate pack step")
+          expect_candidate_rejected(
+              rebuild_decoy,
+              "a rebuild after the package gates",
+          )
+          PYTHON
+
+  reuse:
+    name: REUSE 3.3 compliance
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate licensing metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/data:ro" \
+            --workdir /data \
+            docker.io/fsfe/reuse@sha256:85462a75c0f8efda09ddd190b92816b70e7662577c8427429e11e1b9f25a992e \
+            lint
 
   dco:
     name: DCO sign-off
@@ -86,8 +900,65 @@ jobs:
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/pulls/${PULL_REQUEST_NUMBER}/commits" \
             > "${RUNNER_TEMP}/commits.json"
-          jq -e '
-            add
-            | length > 0 and all(.[].commit.message;
-                test("(?im)^Signed-off-by: [^<\\n]+ <[^>\\n]+>$"))
-          ' "${RUNNER_TEMP}/commits.json" > /dev/null
+          node - "${RUNNER_TEMP}/commits.json" <<'NODE'
+          const fs = require('node:fs');
+          const { spawnSync } = require('node:child_process');
+
+          const pages = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          const commits = pages.flat();
+          if (commits.length === 0) throw new Error('Pull request has no commits.');
+          const normalizeName = (value) => value.trim().replace(/\s+/g, ' ');
+          const parseTerminalTrailers = (message) => {
+            const lines = message.replace(/\r\n?/g, '\n').split('\n');
+            while (lines.at(-1)?.trim() === '') lines.pop();
+            let start = lines.length;
+            while (start > 0 && lines[start - 1].trim() !== '') start -= 1;
+            if (start === 0 || lines.slice(0, start).every((line) => line.trim() === '')) {
+              return [];
+            }
+            const block = lines.slice(start);
+            const trailerLine = /^[A-Za-z0-9-]+:\s+\S.*$/;
+            const continuationLine = /^[ \t]+\S.*$/;
+            if (
+              block.length === 0 ||
+              !block.every((line) => trailerLine.test(line) || continuationLine.test(line))
+            ) {
+              return [];
+            }
+            const parsed = spawnSync('git', ['interpret-trailers', '--parse'], {
+              input: `Policy verification\n\n${block.join('\n')}\n`,
+              encoding: 'utf8',
+              stdio: ['pipe', 'pipe', 'pipe'],
+            });
+            if (parsed.status !== 0) {
+              throw new Error(`git interpret-trailers failed: ${parsed.stderr.trim()}`);
+            }
+            return parsed.stdout;
+          };
+          for (const entry of commits) {
+            const identities = [entry.commit.author, entry.commit.committer]
+              .filter(Boolean)
+              .map(({ name, email }) => ({
+                name: normalizeName(name),
+                email: email.trim().toLowerCase(),
+              }));
+            const trailers = [...parseTerminalTrailers(entry.commit.message).matchAll(
+              /^Signed-off-by:\s*([^<\n]+?)\s*<([^>\n]+)>\s*$/gim,
+            )].map((match) => ({
+              name: normalizeName(match[1]),
+              email: match[2].trim().toLowerCase(),
+            }));
+            const valid = trailers.some((trailer) =>
+              identities.some(
+                (identity) =>
+                  identity.name === trailer.name &&
+                  identity.email === trailer.email,
+              ),
+            );
+            if (!valid) {
+              throw new Error(
+                `Commit ${entry.sha.slice(0, 12)} lacks an author- or committer-matching Signed-off-by trailer.`,
+              );
+            }
+          }
+          NODE
