@@ -7,6 +7,11 @@ Public package repositories call reusable workflows by an immutable commit
 SHA. Changes to those workflows require a reviewed pull request and a caller
 update; mutable branch or tag references are not accepted.
 
+`public-package-ci.yml` defaults to required Node.js 22 and 24 checks plus an
+informational Node.js 26 check. Callers with a narrower support policy may pass
+`required-node-versions` as a JSON array and disable the informational job with
+`run-node-26: false`.
+
 The candidate policy requires downloaded attestation bundles to be normalized
 from GitHub CLI's Linux `sha512:<digest>.jsonl` filename to the portable
 `sha512-<digest>.jsonl` form before verification and artifact retention.

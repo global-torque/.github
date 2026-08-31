@@ -8,6 +8,16 @@ on:
         required: false
         type: boolean
         default: false
+      required-node-versions:
+        description: JSON array of Node.js versions used for required package checks.
+        required: false
+        type: string
+        default: '["22.23.1", "24.18.0"]'
+      run-node-26:
+        description: Run the informational Node.js 26 package check.
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -19,9 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node:
-          - 22.23.1
-          - 24.18.0
+        node: ${{ fromJSON(inputs.required-node-versions) }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -46,6 +54,7 @@ jobs:
 
   informational-node-26:
     name: Node 26 informational
+    if: inputs.run-node-26
     continue-on-error: true
     runs-on: ubuntu-24.04
     steps:
