@@ -449,6 +449,13 @@ jobs:
               "done",
               "exit 1",
           )
+          NORMALIZE_ATTESTATION_COMMANDS = (
+              "set -euo pipefail",
+              "shopt -s nullglob",
+              "bundles=(release/sha512:*.jsonl)",
+              'test "${#bundles[@]}" -eq 1',
+              'mv "${bundles[0]}" "${bundles[0]/sha512:/sha512-}"',
+          )
           VERIFY_ATTESTATION_COMMANDS = (
               "set -euo pipefail",
               "shopt -s nullglob",
@@ -584,6 +591,13 @@ jobs:
                   f"{source} attestation download",
                   shell=True,
                   environment={"GH_TOKEN": github_expression("github.token")},
+              )
+              cursor += 1
+              require_run_step(
+                  steps[cursor],
+                  NORMALIZE_ATTESTATION_COMMANDS,
+                  f"{source} attestation filename normalization",
+                  shell=True,
               )
               cursor += 1
               require_run_step(
@@ -861,6 +875,20 @@ jobs:
           expect_candidate_rejected(
               rebuild_decoy,
               "a rebuild after the package gates",
+          )
+
+          normalization_decoy = copy.deepcopy(candidate_document)
+          normalization_decoy["jobs"]["build"]["steps"] = [
+              step
+              for step in normalization_decoy["jobs"]["build"]["steps"]
+              if not (
+                  isinstance(step, dict)
+                  and step.get("name") == "Normalize attestation bundle filename"
+              )
+          ]
+          expect_candidate_rejected(
+              normalization_decoy,
+              "missing attestation filename normalization",
           )
           PYTHON
 
