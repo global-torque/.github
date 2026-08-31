@@ -638,15 +638,24 @@ jobs:
               )
               require_policy(clean["needs"] == "build", f"{source} clean-room dependency changed")
               require_policy(clean["runs-on"] == "ubuntu-24.04", f"{source} clean-room runner changed")
-              require_policy(
-                  clean["strategy"]
-                  == {
+              allowed_clean_room_strategies = (
+                  {
                       "fail-fast": False,
                       "matrix": {
                           "manager": ["npm", "pnpm"],
                           "node": ["22.23.1", "24.18.0"],
                       },
                   },
+                  {
+                      "fail-fast": False,
+                      "matrix": {
+                          "manager": ["npm", "pnpm"],
+                          "node": ["24.18.0"],
+                      },
+                  },
+              )
+              require_policy(
+                  clean["strategy"] in allowed_clean_room_strategies,
                   f"{source} clean-room matrix changed",
               )
               clean_steps = clean["steps"]
@@ -821,6 +830,15 @@ jobs:
           candidate_path = Path(".github/workflows/candidate.yml")
           candidate_document = repository_scanner.load_document(candidate_path)
           validate_candidate_document(candidate_document, candidate_path.as_posix())
+
+          node_24_candidate = copy.deepcopy(candidate_document)
+          node_24_candidate["jobs"]["clean-room"]["strategy"]["matrix"]["node"] = [
+              "24.18.0"
+          ]
+          validate_candidate_document(
+              node_24_candidate,
+              "node-24-candidate-policy-self-test.yml",
+          )
 
           def expect_candidate_rejected(candidate: object, description: str) -> None:
               try:
